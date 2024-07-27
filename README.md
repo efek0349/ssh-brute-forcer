@@ -17,13 +17,16 @@ A simple, multi-threaded SSH brute force tool designed for basic brute forcing a
 ## Compile
 
 ```
-$ cc -o ssh-brute-forcer ssh-brute-forcer.c -I/usr/local/include -L/usr/local/lib -lssh -pthread -Wno-discarded-qualifiers -Wno-incompatible-pointer-types-discards-qualifiers -Wno-unknown-warning-option
+$ cc -o ssh-brute-forcer ssh-brute-forcer.c -I/usr/local/include -L/usr/local/lib -lssh\
+	-pthread -Wno-discarded-qualifiers -Wno-incompatible-pointer-types-discards-qualifiers\
+	-Wno-unknown-warning-option
 ```
 
 ## Usage
 
 ```
-$ ./ssh-brute-forcer -h <hostname> -p <port> [-u <username>] [-p <password> | -P <password_list>] [-t <thread_count>] [-V]
+$ ./ssh-brute-forcer -h <hostname> -p <port> [-u <username>] [-p <password> |\
+	 -P <password_list>] [-t <thread_count>] [-V]
 ```
 Parameters
 
